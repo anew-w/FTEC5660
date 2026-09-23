@@ -62,8 +62,46 @@ def build_chain() -> Any:
     Use the vision-capable DeepSeek Flash model named
     ``deepseek-v4-flash-vision-exp``. The API key is loaded from .env.
     """
-    ### YOUR CODE HERE
-    return None
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_deepseek import ChatDeepSeek
+
+    model = ChatDeepSeek(
+        model="deepseek-v4-flash-vision-exp",
+        temperature=0,
+    )
+
+    system_message = (
+        "You are a precise receipt analyzer specialized in Hong Kong supermarket receipts. "
+        "Read the receipt image carefully and extract exactly two monetary values.\n\n"
+        "1. FINAL_PAID: The actual amount the customer paid. "
+        "Find the payment method line (e.g., OCTOPUS, CASH, VISA, FPS, Alipay, WeChat Pay) "
+        "which shows the amount AFTER the ROUNDING adjustment. "
+        "This is the final deducted amount from the customer. Ignore '找續' (change given back).\n\n"
+        "2. WITHOUT_DISCOUNT: Calculate what the total would be if NO discounts were applied.\n"
+        "   - Find the SUBTOTAL (小計) line — this is the total after discounts but before rounding.\n"
+        "   - Find ALL discount/promotion/coupon lines (lines with negative amounts like '-$X.XX', "
+        "'X% OFF', 'Buy X Save $X', '包裝變形', member discounts, app discounts, etc.).\n"
+        "   - Add the absolute values of all those discount lines back to the SUBTOTAL.\n"
+        "   - Do NOT add back the ROUNDING amount.\n"
+        "   Result = SUBTOTAL + sum of all discount absolute values.\n\n"
+        "IMPORTANT: Before returning, verify your numbers:\n"
+        "   - Double-check the SUBTOTAL amount by reading that line very carefully.\n"
+        "   - List every discount line you found with its amount, then sum them.\n"
+        "   - Ensure your calculation is accurate to the cent.\n\n"
+        "Return ONLY a JSON object in this exact format with no other text:\n"
+        '{{"final_paid":"XX.XX","without_discount":"XX.XX"}}\n\n'
+        "Use exactly 2 decimal places for each amount. No markdown, no explanations."
+    )
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_message),
+        ("human", [
+            {"type": "text", "text": "Analyze this receipt and return the JSON."},
+            {"type": "image_url", "image_url": {"url": "{image_url}"}},
+        ]),
+    ])
+
+    return prompt | model
 
 
 def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
@@ -78,9 +116,58 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
     multimodal human messages. LangChain's ``batch`` method is one simple way
     to process independent receipt-extraction prompts in parallel.
     """
-    ### YOUR CODE HERE
-    _ = (chain, images)
-    return {QUERY_1: DUMMY_RESPONSE, QUERY_2: DUMMY_RESPONSE}
+    if not images:
+        return {QUERY_1: DUMMY_RESPONSE, QUERY_2: DUMMY_RESPONSE}
+
+    inputs = [{"image_url": image_data_url(img)} for img in images]
+    results = chain.batch(inputs, config={"max_concurrency": 5})
+
+    total_final = Decimal("0")
+    total_without = Decimal("0")
+
+    print("\nReceipt                Q1 (Final Paid)    Q2 (Without Discount)")
+    print("-" * 60)
+
+    for img_path, result in zip(images, results):
+        text = response_text(result)
+
+        # JSON parsing
+        final_paid: Decimal | None = None
+        without_discount: Decimal | None = None
+        try:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                data = json.loads(text[start:end + 1])
+                final_paid = Decimal(str(data.get("final_paid", "0")))
+                without_discount = Decimal(str(data.get("without_discount", "0")))
+        except Exception:
+            pass
+
+        # Fallback regex
+        if final_paid is None or without_discount is None:
+            matches = _MONEY_RE.findall(text)
+            if len(matches) >= 2:
+                final_paid = Decimal(matches[0].replace(",", ""))
+                without_discount = Decimal(matches[1].replace(",", ""))
+            elif len(matches) == 1:
+                final_paid = Decimal(matches[0].replace(",", ""))
+                without_discount = Decimal("0")
+            else:
+                final_paid = Decimal("0")
+                without_discount = Decimal("0")
+
+        total_final += final_paid
+        total_without += without_discount
+        print(f"{img_path.name:<22} HK${final_paid:>10.2f}        HK${without_discount:>10.2f}")
+
+    print("-" * 60)
+    print(f"{'TOTAL':<22} HK${total_final:>10.2f}        HK${total_without:>10.2f}\n")
+
+    return {
+        QUERY_1: f"HK${total_final:.2f}",
+        QUERY_2: f"HK${total_without:.2f}",
+    }
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
